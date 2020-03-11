@@ -134,6 +134,49 @@ def get_activations(files, model, batch_size=50, dims=2048,
 
     return pred_arr
 
+def get_activations_from_imgs(files, model, batch_size=50, dims=2048,
+                    cuda=False, verbose=False):
+    model.eval()
+
+    if batch_size > len(files):
+        print(('Warning: batch size is bigger than the data size. '
+               'Setting batch size to data size'))
+        batch_size = len(files)
+
+    pred_arr = np.empty((len(files), dims))
+
+    for i in tqdm(range(0, len(files), batch_size)):
+        if verbose:
+            print('\rPropagating batch %d/%d' % (i + 1, n_batches),
+                  end='', flush=True)
+        start = i
+        end = i + batch_size
+
+        images = np.array([f.astype(np.float32)
+                           for f in files[start:end]])
+
+        # Reshape to (n_images, 3, height, width)
+        images = images.transpose((0, 3, 1, 2))
+        images /= 255
+
+        batch = torch.from_numpy(images).type(torch.FloatTensor)
+        if cuda:
+            batch = batch.cuda()
+
+        pred = model(batch)[0]
+
+        # If model output is not scalar, apply global spatial average pooling.
+        # This happens if you choose a dimensionality not equal 2048.
+        if pred.size(2) != 1 or pred.size(3) != 1:
+            pred = adaptive_avg_pool2d(pred, output_size=(1, 1))
+
+        pred_arr[start:end] = pred.cpu().data.numpy().reshape(pred.size(0), -1)
+
+    if verbose:
+        print(' done')
+
+    return pred_arr
+
 
 def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     """Numpy implementation of the Frechet Distance.
@@ -193,7 +236,7 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
 
 def calculate_activation_statistics(files, model, batch_size=50,
-                                    dims=2048, cuda=False, verbose=False):
+                                    dims=2048, cuda=False, verbose=False, is_imgs=False):
     """Calculation of the statistics used by the FID.
     Params:
     -- files       : List of image files paths
@@ -211,22 +254,33 @@ def calculate_activation_statistics(files, model, batch_size=50,
     -- sigma : The covariance matrix of the activations of the pool_3 layer of
                the inception model.
     """
-    act = get_activations(files, model, batch_size, dims, cuda, verbose)
+    if is_imgs:
+        act = get_activations_from_imgs(files, model, batch_size, dims, cuda, verbose)
+    else:
+        act = get_activations(files, model, batch_size, dims, cuda, verbose)
     mu = np.mean(act, axis=0)
     sigma = np.cov(act, rowvar=False)
     return mu, sigma
 
 
 def _compute_statistics_of_path(path, model, batch_size, dims, cuda):
-    if path.endswith('.npz'):
+    if isinstance(path, str) and path.endswith('.npz'):
         f = np.load(path)
         m, s = f['mu'][:], f['sigma'][:]
         f.close()
-    else:
+    elif isinstance(path, str) and os.path.isdir(path):
         path = pathlib.Path(path)
         files = list(path.glob('*.jpg')) + list(path.glob('*.png'))
         m, s = calculate_activation_statistics(files, model, batch_size,
                                                dims, cuda)
+    elif isinstance(path, str) and os.path.isfile(path) and path.lower().endswith(('.jpg', '.png', '.jpeg')):
+        m, s = calculate_activation_statistics([path], model, batch_size,
+                                               dims, cuda)
+    elif len(path) > 0 and type(path[0]) is np.ndarray:
+        m, s = calculate_activation_statistics([path], model, batch_size,
+                                               dims, cuda, is_imgs=True)
+    else:
+        raise RuntimeError('Invalid file or path: %s' % path)
 
     return m, s
 
@@ -234,7 +288,7 @@ def _compute_statistics_of_path(path, model, batch_size, dims, cuda):
 def calculate_fid_given_paths(paths, batch_size, cuda, dims):
     """Calculates the FID of two paths"""
     for p in paths:
-        if not os.path.exists(p):
+        if type(p) is not np.ndarray and not os.path.exists(p):
             raise RuntimeError('Invalid path: %s' % p)
 
     block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
